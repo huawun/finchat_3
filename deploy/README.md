@@ -1,6 +1,6 @@
 # AWS EC2 Deployment Guide
 
-This guide helps deploy the RedShift Chatbot to AWS EC2 with private network connectivity.
+This guide helps deploy the RedShift Chatbot to AWS EC2 with private network connectivity and addresses common network issues.
 
 ## Prerequisites
 
@@ -8,108 +8,337 @@ This guide helps deploy the RedShift Chatbot to AWS EC2 with private network con
 2. **RedShift cluster** in private subnet
 3. **VPC with private subnets** where RedShift is located
 4. **EC2 Key Pair** for SSH access
+5. **Proper IAM permissions** for CloudFormation, EC2, SSM, and Bedrock
 
-## Deployment Steps
+## Quick Deployment
 
-### 1. Store Credentials Securely
+### Option 1: Interactive Deployment (Recommended)
 
 ```bash
 cd deploy
-chmod +x setup-ssm-parameters.sh
-./setup-ssm-parameters.sh
+chmod +x deploy.sh setup-ssm-parameters.sh
+./deploy.sh
 ```
 
-This stores all credentials in AWS Systems Manager Parameter Store (encrypted).
+The script will:
+- Guide you through parameter collection
+- Set up SSM parameters for credentials
+- Deploy CloudFormation stack
+- Configure security groups
+- Provide access instructions
 
-### 2. Deploy EC2 Instance
+### Option 2: Manual Deployment
 
-```bash
-aws cloudformation create-stack \
-  --stack-name finchat-chatbot \
-  --template-body file://cloudformation-template.yaml \
-  --parameters \
-    ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxxx \
-    ParameterKey=SubnetId,ParameterValue=subnet-xxxxxxxxx \
-    ParameterKey=KeyPairName,ParameterValue=your-key-pair \
-  --capabilities CAPABILITY_IAM
-```
+1. **Store Credentials in SSM**
+   ```bash
+   ./setup-ssm-parameters.sh
+   ```
 
-### 3. Access Application
-
-The application will be available at:
-- **Private IP**: `http://<private-ip>:5000`
-- Access via VPN, bastion host, or AWS Systems Manager Session Manager
+2. **Deploy CloudFormation Stack**
+   ```bash
+   aws cloudformation create-stack \
+     --stack-name finchat-chatbot \
+     --template-body file://improved-cloudformation.yaml \
+     --parameters \
+       ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxxx \
+       ParameterKey=SubnetId,ParameterValue=subnet-xxxxxxxxx \
+       ParameterKey=KeyPairName,ParameterValue=your-key-pair \
+       ParameterKey=RedShiftSecurityGroupId,ParameterValue=sg-xxxxxxxxx \
+       ParameterKey=Environment,ParameterValue=nonprod \
+     --capabilities CAPABILITY_NAMED_IAM
+   ```
 
 ## Network Configuration
 
-### Security Groups Required
+### Understanding the Network Setup
 
-1. **EC2 Security Group** (created by template):
-   - Inbound: Port 5000 from private network
+The deployment creates a secure network configuration:
+
+```
+Internet → VPC → Private Subnet → EC2 Instance → RedShift Cluster
+                                              → AWS Bedrock (via IAM)
+```
+
+### Security Groups
+
+1. **EC2 Security Group** (automatically created):
+   - Inbound: Port 5000 from private network (10.0.0.0/8)
+   - Inbound: Port 22 from private network (SSH)
    - Outbound: All traffic (for Docker pulls, AWS API calls)
 
-2. **RedShift Security Group** (update existing):
+2. **RedShift Security Group** (automatically updated):
    - Inbound: Port 5439 from EC2 security group
 
-### Update RedShift Security Group
+### Common Network Issues and Solutions
+
+#### Issue 1: RedShift Connection Timeout
+
+**Symptoms:**
+- Application logs show "Connection timeout" to RedShift
+- Health check shows RedShift as "disconnected"
+
+**Solutions:**
+1. **Check Security Groups:**
+   ```bash
+   # Get EC2 security group ID
+   EC2_SG_ID=$(aws cloudformation describe-stacks \
+     --stack-name finchat-chatbot \
+     --query 'Stacks[0].Outputs[?OutputKey==`SecurityGroupId`].OutputValue' \
+     --output text)
+   
+   # Verify RedShift security group allows access
+   aws ec2 describe-security-groups --group-ids <redshift-sg-id>
+   ```
+
+2. **Check VPC Route Tables:**
+   ```bash
+   # Ensure private subnet has route to NAT Gateway for internet access
+   aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=<subnet-id>"
+   ```
+
+3. **Test Network Connectivity:**
+   ```bash
+   # SSH to EC2 and test RedShift connectivity
+   ssh -i your-key.pem ec2-user@<private-ip>
+   telnet <redshift-endpoint> 5439
+   ```
+
+#### Issue 2: Docker Container Won't Start
+
+**Symptoms:**
+- `docker ps` shows no running containers
+- Application not accessible on port 5000
+
+**Solutions:**
+1. **Check Docker Service:**
+   ```bash
+   sudo systemctl status docker
+   sudo systemctl start docker
+   ```
+
+2. **Check Application Logs:**
+   ```bash
+   cd /opt/finchat
+   docker-compose logs -f
+   ```
+
+3. **Rebuild Container:**
+   ```bash
+   docker-compose down
+   docker-compose up --build -d
+   ```
+
+#### Issue 3: Bedrock Access Denied
+
+**Symptoms:**
+- Health check shows Bedrock as "disconnected"
+- Logs show "Access Denied" for Bedrock
+
+**Solutions:**
+1. **Check IAM Role Permissions:**
+   ```bash
+   # Verify EC2 instance has the correct IAM role
+   aws ec2 describe-instances --instance-ids <instance-id> \
+     --query 'Reservations[0].Instances[0].IamInstanceProfile'
+   ```
+
+2. **Check Bedrock Model Access:**
+   ```bash
+   # Test Bedrock access from EC2
+   aws bedrock list-foundation-models --region us-east-1
+   ```
+
+3. **Verify Region Configuration:**
+   - Ensure Bedrock is available in your region
+   - Check if model access is enabled in Bedrock console
+
+## Deployment Verification
+
+### 1. Check Stack Status
 
 ```bash
-# Get EC2 security group ID from CloudFormation output
-EC2_SG_ID=$(aws cloudformation describe-stacks \
+aws cloudformation describe-stacks --stack-name finchat-chatbot
+```
+
+### 2. Get Instance Information
+
+```bash
+# Get instance details
+INSTANCE_ID=$(aws cloudformation describe-stacks \
   --stack-name finchat-chatbot \
-  --query 'Stacks[0].Outputs[?OutputKey==`SecurityGroupId`].OutputValue' \
+  --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' \
   --output text)
 
-# Add rule to RedShift security group
-aws ec2 authorize-security-group-ingress \
-  --group-id <redshift-security-group-id> \
-  --protocol tcp \
-  --port 5439 \
-  --source-group $EC2_SG_ID
+PRIVATE_IP=$(aws cloudformation describe-stacks \
+  --stack-name finchat-chatbot \
+  --query 'Stacks[0].Outputs[?OutputKey==`PrivateIP`].OutputValue' \
+  --output text)
+
+echo "Instance ID: $INSTANCE_ID"
+echo "Private IP: $PRIVATE_IP"
 ```
 
-## Troubleshooting
-
-### Check Application Status
+### 3. Test Application
 
 ```bash
-# SSH to EC2 instance
-ssh -i your-key.pem ec2-user@<private-ip>
+# SSH to instance
+ssh -i your-key.pem ec2-user@$PRIVATE_IP
 
-# Check Docker containers
-docker ps
-
-# Check application logs
+# Check application status
 cd /opt/finchat
-docker-compose logs -f
+docker ps
+docker-compose logs --tail=50
+
+# Test health endpoint
+curl http://localhost:5000/api/health
+
+# Test info endpoint
+curl http://localhost:5000/api/info
 ```
 
-### Common Issues
+## Access Methods
 
-1. **RedShift Connection Failed**:
-   - Verify security group rules
-   - Check VPC routing
-   - Confirm RedShift endpoint accessibility
+### 1. VPN Access
+If you have VPN access to the VPC:
+```bash
+curl http://<private-ip>:5000
+```
 
-2. **Bedrock Access Denied**:
-   - Verify IAM role permissions
-   - Check AWS region configuration
-   - Ensure Bedrock model access
+### 2. Bastion Host
+Through a bastion host in a public subnet:
+```bash
+ssh -i your-key.pem -L 5000:<private-ip>:5000 ec2-user@<bastion-ip>
+# Then access http://localhost:5000
+```
 
-3. **Docker Issues**:
-   - Check Docker service: `sudo systemctl status docker`
-   - Rebuild container: `docker-compose up --build -d`
+### 3. AWS Systems Manager Session Manager
+```bash
+aws ssm start-session --target <instance-id>
+```
 
-## Alternative: Use IAM Roles Instead of Access Keys
+### 4. Port Forwarding via SSH
+```bash
+ssh -i your-key.pem -L 5000:<private-ip>:5000 ec2-user@<jump-host>
+```
 
-For better security, modify the application to use IAM roles:
+## Monitoring and Maintenance
 
-1. Remove AWS credentials from SSM parameters
-2. Update EC2 role with RedShift and Bedrock permissions
-3. Modify `config.py` to use boto3 default credential chain
+### Health Monitoring
 
-## Monitoring
+```bash
+# Automated health check
+curl -s http://<private-ip>:5000/api/health | jq '.'
 
-- **CloudWatch Logs**: Application logs via CloudWatch agent
-- **Health Check**: `curl http://localhost:5000/api/health`
-- **Metrics**: Custom CloudWatch metrics for query performance
+# Get deployment information
+curl -s http://<private-ip>:5000/api/info | jq '.'
+```
+
+### Log Management
+
+```bash
+# Application logs
+cd /opt/finchat
+docker-compose logs -f
+
+# System logs
+sudo journalctl -u finchat.service -f
+
+# Docker logs
+sudo journalctl -u docker.service -f
+```
+
+### Application Management
+
+```bash
+# Restart application
+sudo systemctl restart finchat
+
+# Stop application
+sudo systemctl stop finchat
+
+# Start application
+sudo systemctl start finchat
+
+# Check service status
+sudo systemctl status finchat
+```
+
+## Scaling and Performance
+
+### Vertical Scaling
+Update the CloudFormation stack with a larger instance type:
+
+```bash
+aws cloudformation update-stack \
+  --stack-name finchat-chatbot \
+  --use-previous-template \
+  --parameters \
+    ParameterKey=InstanceType,ParameterValue=t3.large \
+    # ... other parameters remain the same
+```
+
+### Horizontal Scaling
+For multiple instances, consider:
+1. Application Load Balancer
+2. Auto Scaling Group
+3. Shared session storage (Redis/ElastiCache)
+
+## Security Best Practices
+
+1. **Use IAM Roles**: Never hardcode AWS credentials
+2. **Private Subnets**: Keep RedShift and EC2 in private subnets
+3. **Security Groups**: Use least privilege access
+4. **Encrypted Storage**: Use encrypted EBS volumes
+5. **Parameter Store**: Store sensitive data in SSM Parameter Store
+6. **VPC Flow Logs**: Enable for network monitoring
+7. **CloudTrail**: Enable for API call auditing
+
+## Troubleshooting Commands
+
+```bash
+# Check EC2 instance status
+aws ec2 describe-instances --instance-ids <instance-id>
+
+# Check security group rules
+aws ec2 describe-security-groups --group-ids <sg-id>
+
+# Check SSM parameters
+aws ssm get-parameters --names "/finchat/redshift-host" --with-decryption
+
+# Test network connectivity
+nc -zv <redshift-endpoint> 5439
+
+# Check Docker network
+docker network ls
+docker network inspect finchat_default
+
+# Check application configuration
+cd /opt/finchat && cat .env
+```
+
+## Cleanup
+
+To remove all resources:
+
+```bash
+aws cloudformation delete-stack --stack-name finchat-chatbot
+
+# Wait for deletion to complete
+aws cloudformation wait stack-delete-complete --stack-name finchat-chatbot
+
+# Clean up SSM parameters (optional)
+aws ssm delete-parameters --names \
+  "/finchat/redshift-host" \
+  "/finchat/redshift-database" \
+  "/finchat/redshift-user" \
+  "/finchat/redshift-password"
+```
+
+## Support
+
+For issues:
+1. Check application logs: `docker-compose logs`
+2. Check system logs: `sudo journalctl -u finchat.service`
+3. Verify network connectivity: `telnet <redshift-endpoint> 5439`
+4. Test AWS access: `aws sts get-caller-identity`
+5. Review CloudFormation events in AWS console

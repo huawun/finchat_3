@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RedShift Chatbot EC2 Deployment with Enhanced Private Network Access'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where RedShift cluster is located
+  
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet in same VPC as RedShift
+  
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+  
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge]
+    Description: EC2 instance type
+  
+  RedShiftSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Existing RedShift security group ID
+  
+  Environment:
+    Type: String
+    Default: nonprod
+    AllowedValues: [prod, nonprod]
+    Description: Environment (prod or nonprod)
+
+Resources:
+  # Security Group for EC2 instance
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RedShift Chatbot EC2
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          CidrIp: 10.0.0.0/8
+          Description: HTTP access from private network
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/8
+          Description: SSH access from private network
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub 'finchat-ec2-sg-${Environment}'
+
+  # Security Group Rule for RedShift access
+  RedShiftIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RedShiftSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 5439
+      ToPort: 5439
+      SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Description: Allow access from FinChat EC2
+
+  # IAM Role for EC2 instance with enhanced permissions
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'FinChatEC2Role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:ListFoundationModels
+                Resource: '*'
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: 
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/finchat/*'
+        - PolicyName: RedShiftAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - redshift:DescribeClusters
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:GetStatementResult
+                  - redshift-data:DescribeStatement
+                Resource: '*'
+
+  # Instance Profile
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # Launch Template for better configuration management
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'finchat-template-${Environment}'
+      LaunchTemplateData:
+        ImageId: ami-0c02fb55956c7d316  # Amazon Linux 2 AMI
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y docker git curl wget
+            
+            # Install Docker Compose
+            curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+            
+            # Start Docker
+            systemctl start docker
+            systemctl enable docker
+            usermod -a -G docker ec2-user
+            
+            # Install CloudWatch agent
+            wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+            rpm -U ./amazon-cloudwatch-agent.rpm
+            
+            # Create application directory
+            mkdir -p /opt/finchat
+            cd /opt/finchat
+            
+            # Clone repository
+            git clone https://github.com/huawun/finchat_3.git .
+            
+            # Create environment file with SSM parameter references
+            cat > .env << 'EOF'
+            AWS_REGION=${AWS::Region}
+            BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20241022-v2:0
+            BEDROCK_MAX_TOKENS=4096
+            BEDROCK_TEMPERATURE=0.0
+            REDSHIFT_PORT=5439
+            REDSHIFT_SSL=True
+            REDSHIFT_SCHEMA=public
+            FLASK_ENV=production
+            FLASK_DEBUG=False
+            PORT=5000
+            MAX_QUERY_TIMEOUT=30
+            MAX_RESULT_ROWS=1000
+            ENVIRONMENT=${Environment}
+            EOF
+            
+            # Create startup script that loads from SSM
+            cat > /opt/finchat/load-config.sh << 'EOF'
+            #!/bin/bash
+            # Load configuration from SSM Parameter Store
+            export AWS_DEFAULT_REGION=${AWS::Region}
+            
+            # Get parameters from SSM
+            REDSHIFT_HOST=$(aws ssm get-parameter --name "/finchat/redshift-host" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+            REDSHIFT_DATABASE=$(aws ssm get-parameter --name "/finchat/redshift-database" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+            REDSHIFT_USER=$(aws ssm get-parameter --name "/finchat/redshift-user" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+            REDSHIFT_PASSWORD=$(aws ssm get-parameter --name "/finchat/redshift-password" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+            
+            # Update .env file
+            if [ ! -z "$REDSHIFT_HOST" ]; then
+                echo "REDSHIFT_HOST=$REDSHIFT_HOST" >> .env
+            fi
+            if [ ! -z "$REDSHIFT_DATABASE" ]; then
+                echo "REDSHIFT_DATABASE=$REDSHIFT_DATABASE" >> .env
+            fi
+            if [ ! -z "$REDSHIFT_USER" ]; then
+                echo "REDSHIFT_USER=$REDSHIFT_USER" >> .env
+            fi
+            if [ ! -z "$REDSHIFT_PASSWORD" ]; then
+                echo "REDSHIFT_PASSWORD=$REDSHIFT_PASSWORD" >> .env
+            fi
+            EOF
+            
+            chmod +x /opt/finchat/load-config.sh
+            
+            # Set ownership
+            chown -R ec2-user:ec2-user /opt/finchat
+            chmod 600 /opt/finchat/.env
+            
+            # Create systemd service for the application
+            cat > /etc/systemd/system/finchat.service << 'EOF'
+            [Unit]
+            Description=FinChat RedShift Chatbot
+            After=docker.service
+            Requires=docker.service
+            
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            WorkingDirectory=/opt/finchat
+            ExecStartPre=/opt/finchat/load-config.sh
+            ExecStart=/usr/local/bin/docker-compose up -d
+            ExecStop=/usr/local/bin/docker-compose down
+            User=ec2-user
+            Group=ec2-user
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            
+            # Enable and start the service
+            systemctl daemon-reload
+            systemctl enable finchat.service
+            
+            # Wait for Docker to be ready and start the application
+            sleep 30
+            sudo -u ec2-user bash -c 'cd /opt/finchat && ./load-config.sh && /usr/local/bin/docker-compose up -d'
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub 'finchat-chatbot-${Environment}'
+              - Key: Environment
+                Value: !Ref Environment
+
+  # EC2 Instance
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetId
+
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+  
+  PrivateIP:
+    Description: Private IP address
+    Value: !GetAtt EC2Instance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIP'
+  
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+  
+  ApplicationURL:
+    Description: Application URL (accessible from within VPC)
+    Value: !Sub 'http://${EC2Instance.PrivateIp}:5000'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationURL'
+  
+  SSHCommand:
+    Description: SSH command to connect to instance
+    Value: !Sub 'ssh -i your-key.pem ec2-user@${EC2Instance.PrivateIp}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SSHCommand'
