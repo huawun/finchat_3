@@ -129,7 +129,7 @@ Resources:
     Properties:
       LaunchTemplateName: !Sub 'finchat-template-${Environment}'
       LaunchTemplateData:
-        ImageId: ami-0c02fb55956c7d316  # Amazon Linux 2 AMI
+        ImageId: ami-0441960019378ba16  # Amazon Linux 2 AMI (ap-southeast-1)
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyPairName
         SecurityGroupIds:
