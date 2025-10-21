@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RedShift Chatbot EC2 Deployment with Private Network Access'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where RedShift cluster is located
+  
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet in same VPC as RedShift
+  
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+  
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large]
+    Description: EC2 instance type
+
+Resources:
+  # Security Group for EC2 instance
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RedShift Chatbot EC2
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          CidrIp: 10.0.0.0/8
+          Description: HTTP access from private network
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/8
+          Description: SSH access from private network
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: finchat-ec2-sg
+
+  # IAM Role for EC2 instance
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: 
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/finchat/*'
+
+  # Instance Profile
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # EC2 Instance
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0c02fb55956c7d316  # Amazon Linux 2 AMI (update for your region)
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y docker git
+          systemctl start docker
+          systemctl enable docker
+          usermod -a -G docker ec2-user
+          
+          curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+          
+          mkdir -p /opt/finchat
+          cd /opt/finchat
+          git clone https://github.com/huawun/finchat_3.git .
+          
+          # Create .env from SSM parameters
+          cat > .env << EOF
+          AWS_REGION=${AWS::Region}
+          BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20241022-v2:0
+          BEDROCK_MAX_TOKENS=4096
+          BEDROCK_TEMPERATURE=0.0
+          REDSHIFT_PORT=5439
+          REDSHIFT_SSL=True
+          REDSHIFT_SCHEMA=public
+          FLASK_ENV=production
+          FLASK_DEBUG=False
+          PORT=5000
+          MAX_QUERY_TIMEOUT=30
+          MAX_RESULT_ROWS=1000
+          EOF
+          
+          chown -R ec2-user:ec2-user /opt/finchat
+          chmod 600 .env
+          
+          # Start application
+          /usr/local/bin/docker-compose up -d
+      Tags:
+        - Key: Name
+          Value: finchat-chatbot
+
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
+  
+  PrivateIP:
+    Description: Private IP address
+    Value: !GetAtt EC2Instance.PrivateIp
+  
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref EC2SecurityGroup

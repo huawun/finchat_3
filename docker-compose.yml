@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  finchat:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID}
+      - BEDROCK_MAX_TOKENS=${BEDROCK_MAX_TOKENS}
+      - BEDROCK_TEMPERATURE=${BEDROCK_TEMPERATURE}
+      - REDSHIFT_HOST=${REDSHIFT_HOST}
+      - REDSHIFT_PORT=${REDSHIFT_PORT}
+      - REDSHIFT_DATABASE=${REDSHIFT_DATABASE}
+      - REDSHIFT_USER=${REDSHIFT_USER}
+      - REDSHIFT_PASSWORD=${REDSHIFT_PASSWORD}
+      - REDSHIFT_SSL=${REDSHIFT_SSL}
+      - REDSHIFT_SCHEMA=${REDSHIFT_SCHEMA}
+      - FLASK_ENV=production
+      - FLASK_DEBUG=False
+      - PORT=5000
+      - MAX_QUERY_TIMEOUT=${MAX_QUERY_TIMEOUT}
+      - MAX_RESULT_ROWS=${MAX_RESULT_ROWS}
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
