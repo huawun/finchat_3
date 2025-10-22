@@ -3,6 +3,25 @@
 .env.local
 .env.production
 
+# Credentials and keys
+*.pem
+*.key
+*.crt
+*.cert
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.truststore
+aws-credentials
+credentials
+credentials.json
+service-account.json
+*.ppk
+id_rsa
+id_rsa.pub
+*.pub
+
 # Python
 __pycache__/
 *.py[cod]
